@@ -1,68 +1,75 @@
 """
 Crank-Nicolson finite difference solver for the Black-Scholes PDE.
-
-PDE (in terms of V(S, t), option value as a function of spot S and time t):
-    dV/dt + 0.5 * sigma^2 * S^2 * d2V/dS2 + r * S * dV/dS - r * V = 0
-
-Boundary conditions for a European call with strike K, maturity T:
-    V(S, T) = max(S - K, 0)              # terminal payoff
-    V(0, t) = 0                          # worthless if spot hits zero
-    V(S, t) -> S - K*exp(-r*(T-t))  as S -> infinity
-
-Crank-Nicolson averages the explicit and implicit finite-difference schemes,
-giving unconditional stability and second-order accuracy in both S and t.
 """
 
 import numpy as np
+from scipy.stats import norm
+from scipy.linalg import solve_banded
 
 
 def analytical_black_scholes_call(S0, K, T, r, sigma):
-    """
-    Closed-form Black-Scholes price. Use this as ground truth to validate
-    your finite difference and PINN solvers.
-
-    TODO: implement using the standard d1/d2 formula and scipy.stats.norm.cdf
-    """
-    raise NotImplementedError
+    d1 = (np.log(S0 / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    return S0 * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
 
 
 def build_grid(S_max, T, n_space, n_time):
-    """
-    Build the discretized (S, t) grid.
-
-    TODO: return S array of shape (n_space+1,) from 0 to S_max,
-    and t array of shape (n_time+1,) from 0 to T.
-    """
-    raise NotImplementedError
+    S_grid = np.linspace(0, S_max, n_space + 1)
+    t_grid = np.linspace(0, T, n_time + 1)
+    return S_grid, t_grid
 
 
 def crank_nicolson_step(V, S_grid, dt, r, sigma):
-    """
-    Advance the option value grid V by one timestep using Crank-Nicolson.
+    n = len(S_grid) - 1
+    dS = S_grid[1] - S_grid[0]
+    i = np.arange(1, n)
+    S_i = S_grid[i]
 
-    Hint: this reduces to solving a tridiagonal linear system at each step.
-    Look at scipy.linalg.solve_banded or build the tridiagonal matrices
-    yourself with the standard central-difference coefficients for
-    dV/dS and d2V/dS2.
+    alpha = 0.25 * dt * (sigma**2 * (S_i / dS) ** 2 - r * S_i / dS)
+    beta = -0.5 * dt * (sigma**2 * (S_i / dS) ** 2 + r)
+    gamma = 0.25 * dt * (sigma**2 * (S_i / dS) ** 2 + r * S_i / dS)
 
-    TODO: implement one CN timestep, return updated V.
-    """
-    raise NotImplementedError
+    n_int = n - 1
+    ab_A = np.zeros((3, n_int))
+    ab_A[0, 1:] = -gamma[:-1]
+    ab_A[1, :] = 1 - beta
+    ab_A[2, :-1] = -alpha[1:]
+
+    V_old = V[1:n]
+    rhs = (1 + beta) * V_old
+    rhs[:-1] += gamma[:-1] * V_old[1:]
+    rhs[1:] += alpha[1:] * V_old[:-1]
+    rhs[0] += alpha[0] * V[0]
+    rhs[-1] += gamma[-1] * V[-1]
+
+    V_new_interior = solve_banded((1, 1), ab_A, rhs)
+    V_new = V.copy()
+    V_new[1:n] = V_new_interior
+    return V_new
 
 
 def price_european_call_fd(S0, K, T, r, sigma, S_max=None, n_space=200, n_time=200):
-    """
-    Full pipeline: build grid, set terminal/boundary conditions, step
-    backward in time from t=T to t=0, interpolate to get price at S0.
+    if S_max is None:
+        S_max = 3 * K
+    S_grid, t_grid = build_grid(S_max, T, n_space, n_time)
+    dt = t_grid[1] - t_grid[0]
 
-    TODO: wire the above functions together.
-    """
-    raise NotImplementedError
+    V = np.maximum(S_grid - K, 0.0)
+
+    for step in range(n_time):
+        t_after_step = T - (step + 1) * dt
+        V[0] = 0.0
+        V[-1] = S_max - K * np.exp(-r * t_after_step)
+        V = crank_nicolson_step(V, S_grid, dt, r, sigma)
+        V[0] = 0.0
+        V[-1] = S_max - K * np.exp(-r * t_after_step)
+
+    return float(np.interp(S0, S_grid, V))
 
 
 if __name__ == "__main__":
-    # Sanity check: FD price should match analytical price to <0.1%
     S0, K, T, r, sigma = 100, 100, 1.0, 0.05, 0.2
     fd_price = price_european_call_fd(S0, K, T, r, sigma)
     exact_price = analytical_black_scholes_call(S0, K, T, r, sigma)
-    print(f"FD price: {fd_price:.4f}, Analytical: {exact_price:.4f}")
+    err_pct = abs(fd_price - exact_price) / exact_price * 100
+    print(f"FD price: {fd_price:.4f}, Analytical: {exact_price:.4f}, error: {err_pct:.3f}%")
